@@ -1,2 +1,411 @@
+import { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
+import { Home, UserPlus, Search, List } from 'lucide-react';
+
+// Variáveis globais fornecidas pelo ambiente Canvas
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+function App() {
+  const [currentPage, setCurrentPage] = useState('home');
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [services, setServices] = useState([]);
+  const [loadingServices, setLoadingServices] = useState(true);
+  const [message, setMessage] = useState({ text: '', type: '' }); // 'success' or 'error'
+
+  // Efeito para inicializar Firebase e autenticar o usuário
+  useEffect(() => {
+    async function initFirebase() {
+      try {
+        // Inicializa o Firebase App
+        const firebaseApp = initializeApp(firebaseConfig);
+        const firestoreDb = getFirestore(firebaseApp);
+        const firebaseAuth = getAuth(firebaseApp);
+
+        setDb(firestoreDb);
+        setAuth(firebaseAuth);
+
+        // Listener para mudanças no estado de autenticação
+        onAuthStateChanged(firebaseAuth, (user) => {
+          if (user) {
+            setUserId(user.uid);
+          } else {
+            setUserId(null); // Usuário deslogado
+          }
+          setIsAuthReady(true);
+        });
+
+        // Tenta autenticar com o token personalizado ou anonimamente
+        if (initialAuthToken) {
+          await signInWithCustomToken(firebaseAuth, initialAuthToken);
+        } else {
+          await signInAnonymously(firebaseAuth);
+        }
+
+      } catch (error) {
+        console.error("Erro ao inicializar Firebase ou autenticar:", error);
+        setMessage({ text: 'Erro ao conectar ao serviço de dados.', type: 'error' });
+        setIsAuthReady(true); // Ainda marca como pronto para não travar a UI
+      }
+    }
+
+    initFirebase();
+  }, []);
+
+  // Efeito para carregar serviços quando o Firebase estiver pronto e o usuário autenticado
+  useEffect(() => {
+    if (db && auth && userId && isAuthReady) {
+      const servicesCollectionRef = collection(db, `artifacts/${appId}/public/data/services`);
+      // Escuta mudanças em tempo real na coleção de serviços
+      const unsubscribe = onSnapshot(servicesCollectionRef, (snapshot) => {
+        const fetchedServices = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        setServices(fetchedServices);
+        setLoadingServices(false);
+      }, (error) => {
+        console.error("Erro ao buscar serviços:", error);
+        setMessage({ text: 'Erro ao carregar serviços.', type: 'error' });
+        setLoadingServices(false);
+      });
+
+      // Retorna a função de limpeza para cancelar a inscrição do listener
+      return () => unsubscribe();
+    } else if (isAuthReady && !userId) {
+      // Se a autenticação estiver pronta mas não houver userId (erro ou anônimo), ainda permite o carregamento
+      console.warn("Usuário não autenticado, serviços públicos podem não ser acessíveis conforme regras de segurança.");
+      setLoadingServices(false); // Permite que a UI continue mesmo sem userId para dados públicos.
+    }
+  }, [db, auth, userId, isAuthReady]); // Dependências: db, auth, userId, isAuthReady
+
+
+  // Componente de Mensagem Flutuante
+  const FloatingMessage = ({ message, type, onClose }) => {
+    if (!message) return null;
+    return (
+      <div className={`fixed top-4 right-4 p-4 rounded-lg shadow-lg text-white ${type === 'success' ? 'bg-green-500' : 'bg-red-500'} z-50 animate-fade-in-down`}>
+        <div className="flex items-center justify-between">
+          <span>{message}</span>
+          <button onClick={onClose} className="ml-4 text-white font-bold">&times;</button>
+        </div>
+      </div>
+    );
+  };
+
+  const clearMessage = () => {
+    setMessage({ text: '', type: '' });
+  };
+
+  // Componente da Página Inicial
+  const HomePage = () => (
+    <div className="flex flex-col items-center justify-center min-h-[calc(100vh-80px)] p-4 text-center">
+      <h1 className="text-4xl font-bold text-blue-800 mb-4">Bem-vindo à Comunidade Solidária!</h1>
+      <p className="text-lg text-gray-700 mb-8 max-w-2xl">
+        Um projeto dedicado a conectar trabalhadores autônomos com a comunidade, facilitando a divulgação de seus serviços e produtos de forma simples e eficiente. Supere as barreiras tecnológicas e faça seu negócio crescer!
+      </p>
+      <div className="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
+        <button
+          onClick={() => setCurrentPage('register')}
+          className="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-full shadow-lg transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
+        >
+          <UserPlus className="mr-2" size={20} /> Cadastre seu Serviço
+        </button>
+        <button
+          onClick={() => setCurrentPage('services')}
+          className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-full shadow-lg transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
+        >
+          <Search className="mr-2" size={20} /> Encontre um Serviço
+        </button>
+      </div>
+      <div className="mt-8 text-gray-600 text-sm">
+        <p>Seu ID de Usuário (apenas para referência interna): <span className="font-mono text-xs break-all">{userId || 'Carregando...'}</span></p>
+      </div>
+    </div>
+  );
+
+  // Componente da Página de Cadastro
+  const RegisterPage = () => {
+    const [name, setName] = useState('');
+    const [serviceType, setServiceType] = useState('');
+    const [description, setDescription] = useState('');
+    const [location, setLocation] = useState('');
+    const [contact, setContact] = useState('');
+    const [isSubmitting, setIsSubmitting] = useState(false);
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      setIsSubmitting(true);
+      if (!db || !userId) {
+        setMessage({ text: 'Erro: Serviço de dados não disponível ou usuário não autenticado.', type: 'error' });
+        setIsSubmitting(false);
+        return;
+      }
+
+      try {
+        // Salva o serviço na coleção pública
+        await addDoc(collection(db, `artifacts/${appId}/public/data/services`), {
+          name,
+          serviceType,
+          description,
+          location,
+          contact,
+          ownerId: userId, // Para referência futura, se necessário
+          createdAt: new Date(),
+        });
+        setMessage({ text: 'Serviço cadastrado com sucesso!', type: 'success' });
+        // Limpa o formulário
+        setName('');
+        setServiceType('');
+        setDescription('');
+        setLocation('');
+        setContact('');
+        setCurrentPage('services'); // Redireciona para a página de serviços
+      } catch (error) {
+        console.error("Erro ao adicionar documento: ", error);
+        setMessage({ text: `Erro ao cadastrar serviço: ${error.message}`, type: 'error' });
+      } finally {
+        setIsSubmitting(false);
+      }
+    };
+
+    return (
+      <div className="max-w-xl mx-auto p-6 bg-white rounded-xl shadow-lg mt-8 mb-8">
+        <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Cadastre seu Serviço</h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label htmlFor="name" className="block text-gray-700 text-sm font-semibold mb-2">Seu Nome / Nome do Negócio</label>
+            <input
+              type="text"
+              id="name"
+              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              aria-required="true"
+            />
+          </div>
+          <div>
+            <label htmlFor="serviceType" className="block text-gray-700 text-sm font-semibold mb-2">Tipo de Serviço/Produto</label>
+            <input
+              type="text"
+              id="serviceType"
+              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={serviceType}
+              onChange={(e) => setServiceType(e.target.value)}
+              placeholder="Ex: Costureira, Confeiteiro, Eletricista"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div>
+            <label htmlFor="description" className="block text-gray-700 text-sm font-semibold mb-2">Descrição Detalhada do Serviço</label>
+            <textarea
+              id="description"
+              rows="4"
+              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Descreva o que você oferece, seus diferenciais, etc."
+              required
+              aria-required="true"
+            ></textarea>
+          </div>
+          <div>
+            <label htmlFor="location" className="block text-gray-700 text-sm font-semibold mb-2">Localização (Bairro/Região)</label>
+            <input
+              type="text"
+              id="location"
+              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              placeholder="Ex: Primavera do Leste - Centro, Bairro X"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div>
+            <label htmlFor="contact" className="block text-gray-700 text-sm font-semibold mb-2">Informações de Contato (Telefone/Email/WhatsApp)</label>
+            <input
+              type="text"
+              id="contact"
+              className="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={contact}
+              onChange={(e) => setContact(e.target.value)}
+              placeholder="Ex: (99) 99999-9999, seu_email@exemplo.com"
+              required
+              aria-required="true"
+            />
+          </div>
+          <button
+            type="submit"
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-md shadow-md transition duration-300 ease-in-out transform hover:scale-105 flex items-center justify-center"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? (
+              <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+            ) : null}
+            {isSubmitting ? 'Cadastrando...' : 'Cadastrar Serviço'}
+          </button>
+        </form>
+      </div>
+    );
+  };
+
+  // Componente da Página de Serviços
+  const ServicesPage = () => {
+    const [searchTerm, setSearchTerm] = useState('');
+    const [filterCategory, setFilterCategory] = useState('');
+    const [filterLocation, setFilterLocation] = useState('');
+
+    const filteredServices = services.filter(service => {
+      const matchesSearch = searchTerm === '' ||
+        service.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        service.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        service.serviceType.toLowerCase().includes(searchTerm.toLowerCase());
+
+      const matchesCategory = filterCategory === '' ||
+        service.serviceType.toLowerCase().includes(filterCategory.toLowerCase());
+
+      const matchesLocation = filterLocation === '' ||
+        service.location.toLowerCase().includes(filterLocation.toLowerCase());
+
+      return matchesSearch && matchesCategory && matchesLocation;
+    });
+
+    // Extrai categorias e locais únicos para os filtros
+    const uniqueCategories = [...new Set(services.map(s => s.serviceType))].sort();
+    const uniqueLocations = [...new Set(services.map(s => s.location))].sort();
+
+    return (
+      <div className="p-4">
+        <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Serviços Disponíveis</h2>
+
+        {/* Barra de Pesquisa e Filtros */}
+        <div className="bg-white p-6 rounded-xl shadow-lg mb-8 flex flex-col md:flex-row gap-4">
+          <input
+            type="text"
+            placeholder="Buscar por nome, descrição ou tipo..."
+            className="flex-grow px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            aria-label="Buscar serviços"
+          />
+          <select
+            className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            value={filterCategory}
+            onChange={(e) => setFilterCategory(e.target.value)}
+            aria-label="Filtrar por categoria"
+          >
+            <option value="">Todas as Categorias</option>
+            {uniqueCategories.map(category => (
+              <option key={category} value={category}>{category}</option>
+            ))}
+          </select>
+          <select
+            className="px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            value={filterLocation}
+            onChange={(e) => setFilterLocation(e.target.value)}
+            aria-label="Filtrar por localização"
+          >
+            <option value="">Todas as Localizações</option>
+            {uniqueLocations.map(location => (
+              <option key={location} value={location}>{location}</option>
+            ))}
+          </select>
+        </div>
+
+        {loadingServices ? (
+          <div className="flex justify-center items-center h-48">
+            <svg className="animate-spin h-10 w-10 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p className="ml-3 text-lg text-gray-600">Carregando serviços...</p>
+          </div>
+        ) : filteredServices.length === 0 ? (
+          <p className="text-center text-gray-600 text-lg">Nenhum serviço encontrado. Tente ajustar os filtros ou seja o primeiro a cadastrar um serviço!</p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {filteredServices.map(service => (
+              <div key={service.id} className="bg-white p-6 rounded-xl shadow-lg border border-gray-200 hover:shadow-xl transition duration-300 ease-in-out">
+                <h3 className="text-xl font-semibold text-blue-700 mb-2">{service.name}</h3>
+                <p className="text-gray-600 mb-1">
+                  <strong className="text-gray-700">Tipo:</strong> {service.serviceType}
+                </p>
+                <p className="text-gray-600 mb-1">
+                  <strong className="text-gray-700">Local:</strong> {service.location}
+                </p>
+                <p className="text-gray-700 text-sm mb-3">{service.description}</p>
+                <div className="mt-4 pt-3 border-t border-gray-200">
+                  <p className="text-sm text-gray-500">Contato: <span className="font-medium text-blue-600">{service.contact}</span></p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+
+  return (
+    <div className="min-h-screen bg-gray-100 font-inter antialiased">
+      {/* Barra de Navegação */}
+      <nav className="bg-blue-700 p-4 shadow-lg">
+        <div className="container mx-auto flex justify-between items-center">
+          <button onClick={() => setCurrentPage('home')} className="text-white text-2xl font-bold flex items-center">
+            <Home className="mr-2" size={24} /> Comunidade Solidária
+          </button>
+          <div className="flex space-x-4">
+            <button
+              onClick={() => setCurrentPage('register')}
+              className={`py-2 px-4 rounded-full transition duration-300 ease-in-out flex items-center ${currentPage === 'register' ? 'bg-blue-800 text-white shadow-md' : 'text-blue-100 hover:bg-blue-600'}`}
+            >
+              <UserPlus className="mr-1" size={18} /> Cadastrar
+            </button>
+            <button
+              onClick={() => setCurrentPage('services')}
+              className={`py-2 px-4 rounded-full transition duration-300 ease-in-out flex items-center ${currentPage === 'services' ? 'bg-blue-800 text-white shadow-md' : 'text-blue-100 hover:bg-blue-600'}`}
+            >
+              <List className="mr-1" size={18} /> Serviços
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      <FloatingMessage
+        message={message.text}
+        type={message.type}
+        onClose={clearMessage}
+      />
+
+      {/* Conteúdo da Página */}
+      <main className="container mx-auto p-4">
+        {currentPage === 'home' && <HomePage />}
+        {currentPage === 'register' && <RegisterPage />}
+        {currentPage === 'services' && <ServicesPage />}
+      </main>
+
+      {/* Rodapé */}
+      <footer className="bg-gray-800 text-white p-4 text-center mt-8">
+        <p>&copy; {new Date().getFullYear()} Comunidade Solidária. Todos os direitos reservados.</p>
+        <p className="text-xs mt-2">Desenvolvido com o objetivo de promover a inclusão digital para autônomos.</p>
+      </footer>
+    </div>
+  );
+}
+
+export default App;
+
 # site.2
 Um site para ajudar empreendedores autonomos
